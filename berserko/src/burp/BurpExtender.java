@@ -100,9 +100,9 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	// private boolean incorrectCreds = false;
 	private boolean gotTGT = false;
 
-	private final String extensionName = "Berserko";
+	private final String extensionName = "Kerberos Authentication";
 	private final String versionString = "0.9 (beta)";
-	private final String tabName = "Berserko";
+	private final String tabName = "Kerberos Authentication";
 
 	private List<String> workingSet = null;
 	private Map<String, String> hostnameToSpnMap = null;
@@ -160,7 +160,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 
 		manager = GSSManager.getInstance();
 
-		log(1, "Berserko version " + versionString);
+		log(1, "Kerberos Authentication version " + versionString);
 
 		/*
 		 * clearLoginContext(); workingSet = Collections.synchronizedList(new
