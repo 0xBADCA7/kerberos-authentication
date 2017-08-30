@@ -181,7 +181,6 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 		{
 			alertAndLog( 1, "Warning: JCE Unlimited Strength Jurisdiction Policy does not appear to be installed in your JRE. This restricts the set of cryptographic algorithms available to Burp and could lead to failure to perform Kerberos authentication in some domains. See http://docs.oracle.com/javase/7/docs/technotes/guides/security/SunProviders.html#importlimits. Also note that newer versions of Burp seem to have a workaround for this.");
 		}
->>>>>>> d9533729fc42738e47f0e91d910fbec6a680fbed
 
 		/*
 		 * clearLoginContext(); workingSet = Collections.synchronizedList(new
