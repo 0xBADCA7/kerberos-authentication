@@ -26,6 +26,7 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
+import java.security.NoSuchAlgorithmException;
 import java.security.PrivilegedActionException;
 import java.security.PrivilegedExceptionAction;
 import java.sql.Timestamp;
@@ -41,6 +42,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import javax.crypto.Cipher;
 import javax.naming.Context;
 import javax.naming.directory.Attribute;
 import javax.naming.directory.Attributes;
@@ -58,18 +60,21 @@ import javax.security.auth.login.Configuration;
 import javax.security.auth.login.LoginContext;
 import javax.swing.BorderFactory;
 import javax.swing.ButtonGroup;
+import javax.swing.DefaultListModel;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JFileChooser;
 import javax.swing.JLabel;
+import javax.swing.JList;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JPasswordField;
 import javax.swing.JRadioButton;
 import javax.swing.JScrollPane;
 import javax.swing.JTextField;
+import javax.swing.ListSelectionModel;
 import javax.swing.SwingUtilities;
 
 import org.ietf.jgss.GSSContext;
@@ -92,6 +97,8 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	private IExtensionHelpers helpers;
 
 	private PrintWriter stdout = null;
+	
+	private boolean unlimitedJCE = false;
 
 	private GSSManager manager;
 	private LoginContext loginContext = null;
@@ -101,7 +108,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	private boolean gotTGT = false;
 
 	private final String extensionName = "Kerberos Authentication";
-	private final String versionString = "0.9 (beta)";
+	private final String versionString = "1.0";
 	private final String tabName = "Kerberos Authentication";
 
 	private List<String> workingSet = null;
@@ -110,7 +117,8 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	private Map<String, List<String>> failedSpnsForHost = null;
 	private List<String> hostnamesWithUnknownSpn = null;
 	private ContextCache contextCache = null;
-
+	private Map<String,Pattern> scopeStringRegexpMap = null;
+	
 	// config
 	private String domainDnsName;
 	private String kdcHost;
@@ -118,8 +126,12 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	private String password;
 
 	private boolean masterSwitch;
+	
 	private boolean plainhostExpand;
 	private boolean ignoreNTLMServers;
+	private boolean everythingInScope;
+	private boolean wholeDomainInScope;
+	private List<String> hostsInScope;
 
 	private boolean savePassword;
 
@@ -161,6 +173,15 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 		manager = GSSManager.getInstance();
 
 		log(1, "Kerberos Authentication version " + versionString);
+		
+		scopeStringRegexpMap = new HashMap<String, Pattern>();
+		unlimitedJCE = isUnlimitedJCE();
+		
+		if( !unlimitedJCE)
+		{
+			alertAndLog( 1, "Warning: JCE Unlimited Strength Jurisdiction Policy does not appear to be installed in your JRE. This restricts the set of cryptographic algorithms available to Burp and could lead to failure to perform Kerberos authentication in some domains. See http://docs.oracle.com/javase/7/docs/technotes/guides/security/SunProviders.html#importlimits. Also note that newer versions of Burp seem to have a workaround for this.");
+		}
+>>>>>>> d9533729fc42738e47f0e91d910fbec6a680fbed
 
 		/*
 		 * clearLoginContext(); workingSet = Collections.synchronizedList(new
@@ -208,6 +229,9 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 			e.printStackTrace(stdout);
 		}
 	}
+	
+	private boolean everythingInScopeDefault = false;
+	private boolean wholeDomainInScopeDefault = true;
 
 	private void setDefaultConfig() {
 		masterSwitch = false;
@@ -217,6 +241,9 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 		alertLevel = logLevel = 1;
 		plainhostExpand = true;
 		ignoreNTLMServers = false;
+		everythingInScope = everythingInScopeDefault;
+		wholeDomainInScope = wholeDomainInScopeDefault;
+		hostsInScope = new ArrayList<String>();
 		authStrategy = AuthStrategy.REACTIVE_401;
 		krb5File = "";
 		System.setProperty("java.security.krb5.conf", "");
@@ -229,6 +256,40 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	private String loadSetting(String a) {
 		return callbacks.loadExtensionSetting(extensionName + "_" + a);
 	}
+	
+	private List<String> hostsListFromString( String s)
+	{
+		List<String> hosts = new ArrayList<String>();
+		
+		String[] tokens = s.split( ";");
+		
+		for( String t : tokens)
+		{
+			if( t.length() > 0)
+			{
+				hosts.add( t);
+			}				
+		}
+		
+		return hosts;
+	}
+	
+	private String hostsStringFromList( List<String> hostsList)
+	{
+		String s = "";
+		
+		for(int ii=0; ii<hostsList.size() - 1; ii++)
+		{
+			s += hostsList.get( ii) + ";";
+		}
+		
+		if( hostsList.size() > 0)
+		{
+			s += hostsList.get( hostsList.size() - 1);
+		}
+		
+		return s;
+	}
 
 	private void logConfig() {
 		log(1, "Domain DNS Name     : " + domainDnsName);
@@ -236,6 +297,9 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 		log(1, "Username            : " + username);
 		log(1, "Password            : " + (password.isEmpty() ? "" : "****"));
 		log(1, "Save password       : " + String.valueOf(savePassword));
+		log(1, "Everything in scope : " + String.valueOf(everythingInScope));
+		log(1, "Domain in scope     : " + String.valueOf(wholeDomainInScope));
+		log(1, "Hosts in scope      : " + hostsStringFromList( hostsInScope));
 		log(1, "Include plainhosts  : " + String.valueOf(plainhostExpand));
 		log(1, "Ignore NTLM servers : " + String.valueOf(ignoreNTLMServers));
 		log(1, "Alert level         : " + String.valueOf(alertLevel));
@@ -254,6 +318,9 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 			saveSetting("password", null);
 		}
 		saveSetting("plainhost_expand", String.valueOf(plainhostExpand));
+		saveSetting("everything_in_scope", String.valueOf( everythingInScope));
+		saveSetting("domain_in_scope", String.valueOf( wholeDomainInScope));
+		saveSetting("hosts_in_scope", hostsStringFromList( hostsInScope));
 		saveSetting("ignore_ntlm_servers", String.valueOf(ignoreNTLMServers));
 		saveSetting("alert_level", String.valueOf(alertLevel));
 		saveSetting("log_level", String.valueOf(logLevel));
@@ -287,6 +354,32 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				: false;
 		ignoreNTLMServers = loadSetting("ignore_ntlm_servers").equals("true") ? true
 				: false;
+		if( loadSetting( "everything_in_scope") != null)
+		{
+			everythingInScope = loadSetting("everything_in_scope").equals("true") ? true
+					: false;
+		}
+		else
+		{
+			everythingInScope = everythingInScopeDefault;
+		}
+		if( loadSetting( "domain_in_scope") != null)
+		{
+			wholeDomainInScope = loadSetting("domain_in_scope").equals("true") ? true
+					: false;
+		}	
+		else
+		{
+			wholeDomainInScope = wholeDomainInScopeDefault;
+		}
+		if( loadSetting( "hosts_in_scope") != null)
+		{
+			hostsInScope = hostsListFromString(loadSetting("hosts_in_scope"));
+		}	
+		else
+		{
+			hostsInScope = new ArrayList<String>();
+		}
 		alertLevel = Integer.parseInt(loadSetting("alert_level"));
 		logLevel = Integer.parseInt(loadSetting("log_level"));
 		authStrategy = AuthStrategy.valueOf(loadSetting("auth_strategy"));
@@ -301,10 +394,10 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	}
 
 	private void addSpnToListIfNotInvalid(List<String> l, String spn,
-			String hostname) {
+			String hostname, int port) {
 		if (!failedSpns.contains(spn)) {
-			if (failedSpnsForHost.containsKey(hostname.toLowerCase())) {
-				if (failedSpnsForHost.get(hostname.toLowerCase()).contains(spn)) {
+			if (failedSpnsForHost.containsKey(hostnameColonPort( hostname, port).toLowerCase())) {
+				if (failedSpnsForHost.get(hostnameColonPort( hostname, port).toLowerCase()).contains(spn)) {
 					return;
 				}
 			}
@@ -312,40 +405,50 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 		}
 	}
 
-	private List<String> hostnameToSpn(String hostname) {
+	private List<String> hostnameToSpn(String hostname, int port) {
 		List<String> ret = new ArrayList<String>();
 
-		if (hostnameToSpnMap.containsKey(hostname.toLowerCase())) {
-			ret.add(hostnameToSpnMap.get(hostname.toLowerCase()));
+		if (hostnameToSpnMap.containsKey(hostnameColonPort(hostname, port).toLowerCase())) {
+			ret.add(hostnameToSpnMap.get(hostnameColonPort(hostname, port).toLowerCase()));
 		} else {
-			if (!hostnamesWithUnknownSpn.contains(hostname.toLowerCase())) {
-				hostnamesWithUnknownSpn.add(hostname.toLowerCase());
+			if (!hostnamesWithUnknownSpn.contains(hostnameColonPort(hostname, port).toLowerCase())) {
+				hostnamesWithUnknownSpn.add(hostnameColonPort(hostname, port).toLowerCase());
 			}
 
 			if (isPlainhostname(hostname)) {
 				addSpnToListIfNotInvalid(ret, "HTTP/"
 						+ expandHostname(hostname).toLowerCase() + "@"
-						+ getRealmName(), hostname);
+						+ getRealmName(), hostname, port);
 				addSpnToListIfNotInvalid(ret, "http/"
 						+ expandHostname(hostname).toLowerCase() + "@"
-						+ getRealmName(), hostname);
+						+ getRealmName(), hostname, port);
 				addSpnToListIfNotInvalid(ret, "HTTP/" + hostname.toLowerCase()
-						+ "@" + getRealmName(), hostname);
+						+ "@" + getRealmName(), hostname, port);
 				addSpnToListIfNotInvalid(ret, "http/" + hostname.toLowerCase()
-						+ "@" + getRealmName(), hostname);
-				// TODO: include port names
-				// TODO: include string from host headers
+						+ "@" + getRealmName(), hostname, port);
 			} else {
 				addSpnToListIfNotInvalid(ret, "HTTP/" + hostname.toLowerCase()
-						+ "@" + getRealmName(), hostname);
+						+ "@" + getRealmName(), hostname, port);
 				addSpnToListIfNotInvalid(ret, "http/" + hostname.toLowerCase()
-						+ "@" + getRealmName(), hostname);
+						+ "@" + getRealmName(), hostname, port);
+				if( port != 80 && port != 443)
+				{
+					addSpnToListIfNotInvalid(ret, "http/" + hostname.toLowerCase() + ":" + port
+							+ "@" + getRealmName(), hostname, port);
+				}
+				
+				// TODO: no need to try plain hostnames here if it doesn't end with DNS domain name?
 				addSpnToListIfNotInvalid(ret,
 						"HTTP/" + getPlainHostname(hostname).toLowerCase()
-								+ "@" + getRealmName(), hostname);
+								+ "@" + getRealmName(), hostname, port);
 				addSpnToListIfNotInvalid(ret,
 						"http/" + getPlainHostname(hostname).toLowerCase()
-								+ "@" + getRealmName(), hostname);
+								+ "@" + getRealmName(), hostname, port);
+				if( port != 80 && port != 443)
+				{
+					addSpnToListIfNotInvalid(ret, "http/" + getPlainHostname(hostname).toLowerCase() + ":" + port
+							+ "@" + getRealmName(), hostname, port);
+				}				
 			}
 		}
 
@@ -357,24 +460,71 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 		return username.toLowerCase() + "@" + getRealmName();
 	}
 
-	private boolean hostnameIsInWorkingSet(String hostname) {
-		return workingSet.contains(expandHostname(hostname).toLowerCase());
+	private boolean hostnameIsInWorkingSet(String hostname, int port) {
+		return workingSet.contains(hostnameColonPort(expandHostname(hostname), port).toLowerCase());
 	}
 
-	private void addHostnameToWorkingSet(String hostname) {
-		if (!workingSet.contains(expandHostname(hostname).toLowerCase())) {
-			log(2, String.format("Adding %s to working set", hostname));
-			workingSet.add(expandHostname(hostname).toLowerCase());
+	private void addHostnameToWorkingSet(String hostname, int port) {
+		if (!workingSet.contains(hostnameColonPort(expandHostname(hostname), port).toLowerCase())) {
+			log(2, String.format("Adding %s to working set", hostnameColonPort( hostname, port)));
+			workingSet.add(hostnameColonPort(expandHostname(hostname), port).toLowerCase());
 		}
 	}
 
+	private Pattern getPatternForScopeString( String s)
+	{
+		if( scopeStringRegexpMap.containsKey(s))
+		{
+			return scopeStringRegexpMap.get(s);
+		}
+		else
+		{
+			// transform the "regexp" from the scope box to an actual hostname
+			String r = s.replace( ".", "\\.");		// dots in hostnames should be treated as literal dots
+			r = s.replace( "-", "\\-");				// same for hyphens
+			r = r.replace( "*", ".*");				// our "regexp" says that * matches zero or more characters. Needs to be ".*"
+			r = r.replace( "?", "[^.]");			// question mark is to match anything but a dot
+			
+			Pattern p = Pattern.compile(r); 
+			scopeStringRegexpMap.put( s, p);
+			return p;
+		}
+	}
+	
 	private boolean hostnameIsInScope(String hostname) {
+		if( everythingInScope)
+		{
+			return true;
+		}
+		else
+		{
+			if( isPlainhostname(hostname) && plainhostExpand && wholeDomainInScope)
+			{
+				return true;
+			}
+			
+			if( wholeDomainInScope && hostname.toLowerCase().endsWith(domainDnsName.toLowerCase()))
+			{
+				return true;
+			}
+			
+			for( String s : hostsInScope)
+			{
+				Pattern p = getPatternForScopeString(s);
+				Matcher m = p.matcher(hostname);
+				if( m.matches())
+				{
+					return true;
+				}
+			}
+		}
+			
 		if (plainhostExpand && isPlainhostname(hostname)) {
 			return true;
 		} else {
 			return hostname.toLowerCase().endsWith(domainDnsName.toLowerCase());
 		}
-	}
+	}	
 
 	private String expandHostname(String hostname) {
 		if (isPlainhostname(hostname)) {
@@ -395,7 +545,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	}
 
 	private boolean isPlainhostname(String hostname) {
-		return hostname.indexOf('.') == -1;
+		return (hostname.length() > 0) && (hostname.indexOf('.') == -1);
 	}
 
 	private String buildAuthenticateHeaderFromToken(String token) {
@@ -524,6 +674,11 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 
 		log(2, String.format("New username (%s) and password set", username));
 	}
+	
+	private String hostnameColonPort( String hostname, int port)
+	{
+		return String.format( "%s:%d", hostname, port);
+	}
 
 	@Override
 	public void processHttpMessage(int toolFlag, boolean messageIsRequest,
@@ -539,6 +694,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 					IRequestInfo reqInfo = helpers.analyzeRequest(messageInfo);
 					List<String> headers = reqInfo.getHeaders();
 					String hostname = messageInfo.getHttpService().getHost();
+					int port = messageInfo.getHttpService().getPort();
 
 					if (hostnameIsInScope(hostname)) {
 						try {
@@ -556,19 +712,19 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 										messageInfo.getRequest(),
 										reqInfo.getBodyOffset(),
 										messageInfo.getRequest().length);
-								log(2, "Getting token for " + hostname);
-								ContextTokenSpnTriple ctst = getToken(hostnameToSpn(hostname));
+								log(2, "Getting token for " + hostnameColonPort( hostname, port));
+								ContextTokenSpnTriple ctst = getToken(hostnameToSpn(hostname, port));
 
 								if (ctst != null) {
 									log(2, "Setting token in request to "
-											+ hostname);
+											+ hostnameColonPort( hostname, port));
 									headers.add(buildAuthenticateHeaderFromToken(ctst
 											.getToken()));
 									messageInfo.setRequest(helpers
 											.buildHttpMessage(headers, body));
-									addHostnameToWorkingSet(hostname);
+									addHostnameToWorkingSet( hostname, port);
 									if (hostnamesWithUnknownSpn
-											.contains(hostname.toLowerCase())) {
+											.contains(hostnameColonPort(hostname, port).toLowerCase())) {
 										contextCache.AddToCache(ctst);
 									}
 								}
@@ -585,8 +741,9 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 					IRequestInfo reqInfo = helpers.analyzeRequest(messageInfo);
 					List<String> headers = reqInfo.getHeaders();
 					String hostname = messageInfo.getHttpService().getHost();
+					int port = messageInfo.getHttpService().getPort();
 
-					if (hostnameIsInWorkingSet(hostname)) {
+					if (hostnameIsInWorkingSet(hostname, port)) {
 						try {
 							if (headersContainStartswith(headers,
 									"Authorization")) {
@@ -598,8 +755,8 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 												"Authorization header (%s) already applied for in-scope host %s; ignoring this host. Perhaps Burp \"Platform Authentication\" is configured against this host?",
 												scheme, hostname));
 							} else {
-								log(2, "Getting token for " + hostname);
-								ContextTokenSpnTriple ctst = getToken(hostnameToSpn(hostname));
+								log(2, "Getting token for " + hostnameColonPort( hostname, port));
+								ContextTokenSpnTriple ctst = getToken(hostnameToSpn(hostname, port));
 
 								if (ctst != null) {
 									byte[] body = Arrays.copyOfRange(
@@ -607,13 +764,13 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 											reqInfo.getBodyOffset(),
 											messageInfo.getRequest().length);
 									log(2, "Setting token in request to "
-											+ hostname);
+											+ hostnameColonPort( hostname, port));
 									headers.add(buildAuthenticateHeaderFromToken(ctst
 											.getToken()));
 									messageInfo.setRequest(helpers
 											.buildHttpMessage(headers, body));
 									if (hostnamesWithUnknownSpn
-											.contains(hostname.toLowerCase())) {
+											.contains(hostnameColonPort(hostname, port).toLowerCase())) {
 										contextCache.AddToCache(ctst);
 									}
 								}
@@ -653,6 +810,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 					byte[] req = messageInfo.getRequest();
 					IRequestInfo reqInfo = helpers.analyzeRequest(messageInfo);
 					String hostname = messageInfo.getHttpService().getHost();
+					int port = messageInfo.getHttpService().getPort();
 					byte[] body = Arrays.copyOfRange(req,
 							reqInfo.getBodyOffset(), req.length);
 					List<String> requestHeaders = helpers.analyzeRequest(req)
@@ -661,7 +819,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 					if (headersContainStartswith(requestHeaders,
 							"Authorization")) // this was a failed authentication...
 					{
-						if (hostnameIsInWorkingSet(hostname)) // ... a failed authentication by us
+						if (hostnameIsInWorkingSet(hostname, port)) // ... a failed authentication by us
 						{
 							String requestToken = getTokenFromAuthorizationNegotiateRequestHeader(getHeaderStartingWith(
 									requestHeaders, "Authorization:"));
@@ -682,29 +840,29 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 											1,
 											String.format(
 													"Failed Kerberos authentication to host %s: unknown error",
-													hostname));
+													hostnameColonPort( hostname, port)));
 								} else if (err
 										.contains("AP_REP token id does not match")) {
 									alertAndLog(
 											1,
 											String.format(
 													"Failed Kerberos authentication to host %s - possibly service ticket for wrong service being used, error message was %s",
-													hostname, err));
+													hostnameColonPort( hostname, port), err));
 									log(2, String.format(
 											"SPN %s incorrect for hostname %s",
-											ctst.getSpn(), hostname));
+											ctst.getSpn(), hostnameColonPort( hostname, port)));
 
-									if (!failedSpnsForHost.containsKey(hostname
+									if (!failedSpnsForHost.containsKey(hostnameColonPort( hostname, port)
 											.toLowerCase())) {
 										failedSpnsForHost.put(
-												hostname.toLowerCase(),
+												hostnameColonPort( hostname, port).toLowerCase(),
 												new ArrayList<String>());
 									}
 									if (!failedSpnsForHost.get(
-											hostname.toLowerCase()).contains(
+											hostnameColonPort( hostname, port).toLowerCase()).contains(
 											ctst.getSpn())) {
 										failedSpnsForHost.get(
-												hostname.toLowerCase()).add(
+												hostnameColonPort( hostname, port).toLowerCase()).add(
 												ctst.getSpn());
 									}
 								} else {
@@ -712,14 +870,14 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 											1,
 											String.format(
 													"Failed Kerberos authentication to host %s: error %s",
-													hostname, err));
+													hostnameColonPort( hostname, port), err));
 								}
 							} else {
 								alertAndLog(
 										1,
 										String.format(
 												"Failed Kerberos authentication to host %s: unknown error",
-												hostname));
+												hostnameColonPort( hostname, port)));
 								log(2,
 										"Response from server: "
 												+ getHeaderStartingWith(
@@ -739,9 +897,9 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 					} else if (authStrategy == AuthStrategy.REACTIVE_401) {
 						try {
 							if (hostnameIsInScope(hostname)
-									&& !hostnameIsInWorkingSet(hostname)) {
-								log(2, "Getting token for " + hostname);
-								ContextTokenSpnTriple ctst = getToken(hostnameToSpn(hostname));
+									&& !hostnameIsInWorkingSet(hostname, port)) {
+								log(2, "Getting token for " + hostnameColonPort( hostname, port));
+								ContextTokenSpnTriple ctst = getToken(hostnameToSpn(hostname, port));
 
 								if (ctst != null) {
 									requestHeaders
@@ -749,7 +907,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 													.getToken()));
 									log(2,
 											"Creating new authenticated request to "
-													+ hostname);
+													+ hostnameColonPort( hostname, port));
 									IHttpRequestResponse resp = callbacks
 											.makeHttpRequest(messageInfo
 													.getHttpService(), helpers
@@ -779,34 +937,34 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 														1,
 														String.format(
 																"Failed Kerberos authentication to host %s: unknown error",
-																hostname));
+																hostnameColonPort( hostname, port)));
 											} else if (err
 													.contains("AP_REP token id does not match")) {
 												alertAndLog(
 														1,
 														String.format(
 																"Failed Kerberos authentication to host %s - possibly service ticket for wrong service being used, error message was %s",
-																hostname, err));
+																hostnameColonPort( hostname, port), err));
 												log(2,
 														String.format(
 																"SPN %s incorrect for hostname %s",
 																ctst.getSpn(),
-																hostname));
+																hostnameColonPort( hostname, port)));
 
 												if (!failedSpnsForHost
-														.containsKey(hostname
+														.containsKey(hostnameColonPort( hostname, port)
 																.toLowerCase())) {
 													failedSpnsForHost
-															.put(hostname
+															.put(hostnameColonPort( hostname, port)
 																	.toLowerCase(),
 																	new ArrayList<String>());
 												}
 												if (!failedSpnsForHost
-														.get(hostname
+														.get(hostnameColonPort( hostname, port)
 																.toLowerCase())
 														.contains(ctst.getSpn())) {
 													failedSpnsForHost
-															.get(hostname
+															.get(hostnameColonPort( hostname, port)
 																	.toLowerCase())
 															.add(ctst.getSpn());
 												}
@@ -817,7 +975,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 														1,
 														String.format(
 																"Failed Kerberos authentication to host %s: error %s",
-																hostname, err));
+																hostnameColonPort( hostname, port), err));
 											}
 										} else {
 											alertAndLog(
@@ -828,15 +986,15 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 										messageInfo.setResponse(resp
 												.getResponse());
 										if (!hostnameToSpnMap
-												.containsKey(hostname
+												.containsKey(hostnameColonPort( hostname, port)
 														.toLowerCase())) {
 											log(2,
 													String.format(
 															"Storing hostname->SPN mapping: %s->%s",
-															hostname.toLowerCase(),
+															hostnameColonPort( hostname, port).toLowerCase(),
 															ctst.getSpn()));
 											hostnameToSpnMap.put(
-													hostname.toLowerCase(),
+													hostnameColonPort( hostname, port).toLowerCase(),
 													ctst.getSpn());
 										}
 									}
@@ -850,11 +1008,11 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 							logException(2, e);
 						}
 					} else if (authStrategy == AuthStrategy.PROACTIVE_AFTER_401
-							&& !hostnameIsInWorkingSet(hostname)
+							&& !hostnameIsInWorkingSet(hostname, port)
 							&& hostnameIsInScope(hostname)) {
 						try {
-							log(2, "Getting token for " + hostname);
-							ContextTokenSpnTriple ctst = getToken(hostnameToSpn(hostname));
+							log(2, "Getting token for " + hostnameColonPort( hostname, port));
+							ContextTokenSpnTriple ctst = getToken(hostnameToSpn(hostname, port));
 
 							if (ctst != null) {
 								requestHeaders
@@ -862,7 +1020,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 												.getToken()));
 
 								log(2, "Creating new authenticated request to "
-										+ hostname);
+										+ hostnameColonPort( hostname, port));
 								IHttpRequestResponse resp = callbacks
 										.makeHttpRequest(messageInfo
 												.getHttpService(), helpers
@@ -889,41 +1047,41 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 												1,
 												String.format(
 														"Failed Kerberos authentication to host %s - possibly service ticket for wrong service being used, error message was %s",
-														hostname, err));
+														hostnameColonPort( hostname, port), err));
 										log(2,
 												String.format(
 														"SPN %s incorrect for hostname %s",
-														ctst.getSpn(), hostname));
+														ctst.getSpn(), hostnameColonPort( hostname, port)));
 
 										if (!failedSpnsForHost
-												.containsKey(hostname
+												.containsKey(hostnameColonPort( hostname, port)
 														.toLowerCase())) {
 											failedSpnsForHost.put(
-													hostname.toLowerCase(),
+													hostnameColonPort( hostname, port).toLowerCase(),
 													new ArrayList<String>());
 										}
 										if (!failedSpnsForHost.get(
-												hostname.toLowerCase())
+												hostnameColonPort( hostname, port).toLowerCase())
 												.contains(ctst.getSpn())) {
 											failedSpnsForHost.get(
-													hostname.toLowerCase())
+													hostnameColonPort( hostname, port).toLowerCase())
 													.add(ctst.getSpn());
 										}
 
 										// TODO: maybe try again with the next SPN?
 									} else {
 										alert(1,
-												String.format("Failed Kerberos authentication to host %s: unknown error, server did not supply WWW-Authenticate response header"));
+												String.format("Failed Kerberos authentication to host %s: unknown error, server did not supply WWW-Authenticate response header", hostnameColonPort( hostname, port)));
 									}
 								} else {
-									addHostnameToWorkingSet(hostname);
+									addHostnameToWorkingSet( hostname, port);
 									log(2,
 											String.format(
 													"Storing hostname->SPN mapping: %s->%s",
-													hostname.toLowerCase(),
+													hostnameColonPort( hostname, port).toLowerCase(),
 													ctst.getSpn()));
 									hostnameToSpnMap.put(
-											hostname.toLowerCase(),
+											hostnameColonPort( hostname, port).toLowerCase(),
 											ctst.getSpn());
 									messageInfo.setResponse(resp.getResponse());
 								}
@@ -939,8 +1097,8 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				} else {
 					if (!contextCache.isEmpty()) {
 						byte[] req = messageInfo.getRequest();
-						String hostname = messageInfo.getHttpService()
-								.getHost();
+						String hostname = messageInfo.getHttpService().getHost();
+						int port = messageInfo.getHttpService().getPort();
 						List<String> requestHeaders = helpers.analyzeRequest(
 								req).getHeaders();
 
@@ -952,16 +1110,16 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 
 						if (ctst != null) {
 							contextCache.RemoveFromCache(requestToken);
-							if (hostnamesWithUnknownSpn.contains(hostname
+							if (hostnamesWithUnknownSpn.contains(hostnameColonPort(hostname, port)
 									.toLowerCase())) {
 								log(2,
 										String.format(
 												"Storing hostname->SPN mapping: %s->%s",
-												hostname.toLowerCase(),
+												hostnameColonPort( hostname, port).toLowerCase(),
 												ctst.getSpn()));
-								hostnamesWithUnknownSpn.remove(hostname
+								hostnamesWithUnknownSpn.remove(hostnameColonPort(hostname, port)
 										.toLowerCase());
-								hostnameToSpnMap.put(hostname.toLowerCase(),
+								hostnameToSpnMap.put(hostnameColonPort(hostname, port).toLowerCase(),
 										ctst.getSpn());
 							}
 						}
@@ -1012,9 +1170,10 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				"WWW-Authenticate: NTLM");
 
 		if (ignoreNTLMServers) {
-			alertAndLog(1, String.format(
-					"Not authenticating to server %s as it supports NTLM",
-					hostname));
+			if( supportsNegotiate && supportsNTLM)
+			{
+				alertAndLog(1, String.format( "Not authenticating to server %s as it supports NTLM", hostname));
+			}
 			return supportsNegotiate && !supportsNTLM;
 		} else {
 			return supportsNegotiate;
@@ -1244,6 +1403,17 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	private void setKrb5Config() {
 		System.setProperty("java.security.krb5.conf", krb5File);
 	}
+	
+	private void clearKerberosState()
+	{
+		clearLoginContext();
+		
+		workingSet = new ArrayList<String>();				
+		hostnameToSpnMap = new HashMap<String, String>();
+		failedSpns = new ArrayList<String>();;
+		failedSpnsForHost = new HashMap<String, List<String>>();
+		hostnamesWithUnknownSpn = new ArrayList<String>();
+	}
 
 	private void setupLoginContext() {
 		if (loginFailed) {
@@ -1327,6 +1497,16 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 										"Failed to acquire TGT on domain %s with user %s - password appears to be invalid. Not making further attempts, to avoid account lockout. Try setting new credentials (and checking the domain details)",
 										domainDnsName, username));
 						// incorrectCreds = true;
+					}
+				} else if( e.getMessage().startsWith( "KDC has no support for encryption type"))
+				{
+					if( unlimitedJCE)
+					{
+						alertAndLog( 1, "Failed to acquire TGT - encryption algorithm not supported by KDC. This is unexpected, as you appear to have the JCE Unlimited Strength Jurisdiction Policy installed.");
+					}
+					else
+					{
+						alertAndLog( 1, "Failed to acquire TGT - encryption algorithm not supported by KDC. This is likely to be because you do not have the JCE Unlimited Strength Jurisdiction Policy installed. See http://docs.oracle.com/javase/7/docs/technotes/guides/security/SunProviders.html#importlimits. Also note that newer versions of Burp seem to have a workaround for this.");
 					}
 				} else {
 					alertAndLog(
@@ -1505,21 +1685,53 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 
 		return false;
 	}
+	
+    private boolean isUnlimitedJCE() {
+        
+        try {
+        	if( Cipher.getMaxAllowedKeyLength("AES") < 256)
+        	{
+        		return false;
+        	}
+        } 
+        catch (NoSuchAlgorithmException ex) 
+        {
+        	try
+        	{
+	        	if( Cipher.getMaxAllowedKeyLength("RC4") < 256)
+	        	{
+	        		return false;
+	        	} 
+        	}
+        	catch(NoSuchAlgorithmException e)
+        	{
+        		return false;	// really shouldn't get here
+        	}
+        }
+        	
+        return true;
+    }
 
 	// ================== GUI code starts here ========================================
 
+	// header
 	JScrollPane scroll;
 	JPanel mainPanel;
 	JCheckBox masterSwitchCheckBox;
 	JLabel versionLabel;
 	JButton restoreDefaultsButton;
+	JButton clearStateButton;
+	
+	// panels
 	JPanel domainPanel;
 	JPanel credsPanel;
 	JPanel authenticationStrategyPanel;
-	JPanel optionsPanel;
+	JPanel scopePanel;
 	JPanel loggingPanel;
 	JPanel delegationPanel;
 	JPanel dummyPanel;
+	
+	// domain settings
 	JLabel domainDnsLabel;
 	JLabel kdcLabel;
 	JTextField domainDnsNameTextField;
@@ -1532,6 +1744,8 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	// JButton domainDnsNameAutoButton;
 	JButton kdcAutoButton;
 	JTextField domainStatusTextField;
+	
+	// credentials
 	JLabel usernameLabel;
 	JLabel passwordLabel;
 	JTextField usernameTextField;
@@ -1544,23 +1758,8 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	JButton credentialControlsHelpButton;
 	JButton savePasswordHelpButton;
 	JTextField credentialsStatusTextField;
-	JLabel alertLevelLabel;
-	JLabel loggingLevelLabel;
-	JComboBox<String> alertLevelComboBox;
-	JComboBox<String> loggingLevelComboBox;
-	JButton alertLevelHelpButton;
-	JButton loggingLevelHelpButton;
-
-	JRadioButton proactiveButton;
-	JRadioButton proactiveAfter401Button;
-	JRadioButton reactiveButton;
-	ButtonGroup authStrategyGroup;
-	JCheckBox ignoreNTLMServersCheckBox;
-	JCheckBox includePlainhostnamesCheckBox;
-	JButton authStrategyHelpButton;
-	JButton ignoreNTLMServersHelpButton;
-	JButton includePlainhostnamesHelpButton;
-
+	
+	// delegation
 	JButton checkDelegationConfigButton;
 	JButton createKrb5ConfButton;
 	JTextField krb5FileTextField;
@@ -1569,28 +1768,67 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	JButton checkCurrentKrb5ConfigHelpButton;
 	JButton delegationControlsHelpButton;
 	JButton krb5FileHelpButton;
+	
+	// strategy
+	JRadioButton proactiveButton;
+	JRadioButton proactiveAfter401Button;
+	JRadioButton reactiveButton;
+	ButtonGroup authStrategyGroup;
+	JButton authStrategyHelpButton;
+	
+	// scope
+	JCheckBox ignoreNTLMServersCheckBox;
+	JCheckBox includePlainhostnamesCheckBox;
+	JCheckBox everythingInScopeCheckBox;
+	JCheckBox wholeDomainInScopeCheckBox;
+	JList<String> scopeListBox;
+	JLabel scopeBoxLabel;
+	JScrollPane scopePane;
+	JButton scopeAddButton;
+	JButton scopeEditButton;
+	JButton scopeRemoveButton;
+	
+	JButton scopeHelpButton;
+	
+	// logging
+	JLabel alertLevelLabel;
+	JLabel loggingLevelLabel;
+	JComboBox<String> alertLevelComboBox;
+	JComboBox<String> loggingLevelComboBox;
+	JButton alertLevelHelpButton;
+	JButton loggingLevelHelpButton;
 
+	// domain settings
 	private final String domainDnsNameHelpString = "DNS name of the domain to authenticate against - not the NETBIOS name.";
 	private final String kdcHelpString = "Hostname of a KDC (domain controller) for this domain.";
-	private final String usernameHelpString = "Username for a domain account. Just the plain username, not DOMAIN\\username or username@DOMAIN.COM or anything like that.";
 	private final String kdcTestSuccessString = "Successfully contacted Kerberos service.";
-	private final String credentialsTestSuccessString = "TGT successfully acquired.";
-	private final String forwardableTgtString = "TGT is forwardable so delegation should work.";
-	private final String notForwardableTgtString = "TGT is not forwardable so delegation will not work - you should use the \"Create local krb5.conf file\" button to fix this.";
-	private final String alertLevelHelpString = "Controls level of logging performed to Burp's Alerts tab.";
-	private final String loggingLevelHelpString = "Controls level of logging performed to extension's standard output.";
-	private final String authStrategyHelpString = "There are three possible approaches here:\n\nReactive: when a 401 response is received from the server, add an appropriate Kerberos authentication header and resend the request. This is what Fiddler does.\nProactive: for hosts which are in scope for Kerberos authentication, add the Kerberos authentication header to outgoing requests (i.e. don't wait to get a 401).\nProactive after 401: use the reactive strategy for the first Kerberos authentication against a particular host, then if it was successful, move to proactive.\n\nThe Reactive approach is perhaps the most \"correct\", but is slower (requires an extra HTTP round trip to the server).\nThe Proactive approach is faster.\nThe Proactive after 401 approach is maybe a good compromise.";
-	private final String ignoreNTLMServersHelpString = "If this is selected, Kerberos authentication will not be performed against hosts which also support NTLM (as evidenced by a WWW-Authenticate: NTLM response header).\n\nThe purpose of selecting this would be to, for example, use Burp's existing NTLM authentication capability for these hosts.";
-	private final String includePlainhostnamesHelpString = "If this is selected, Kerberos authentication will be attempted against hosts which are specified by \"plain hostnames\", i.e. hostnames that are not qualified with the domain.\n\nThe only reason you might want this would be if your machine was joined to a different domain from the one being authenticated against using this extension.";
-	private final String checkCurrentKrb5ConfigHelpString = "Check if the specified krb5.conf file sets forwarding enabled.";
-	private final String delegationControlsHelpString = "\"Change...\" lets you specify the location of the krb5.conf file.\n\n\"Create krb5.conf file\" creates a new minimal krb5.conf file, which will enable delegation, at a location of your choice on the file system.\n\n\"Check current config\" will verify that the specified krb5.conf file exists, and has delegation enabled.";
-	private final String krb5FileHelpString = "The krb5.conf file which will be used (and controls whether delegation is enabled).";
 	private final String domainControlsHelpString = "\"Change...\" lets you change the Domain DNS Name and KDC Host.\n\n\"Autolocate KDC\" will do a DNS SRV lookup to try to find a KDC for the given domain.\n\n\"Test domain settings\" will check that the Kerberos service can be contacted successfully.";
-	private final String credentialControlsHelpString = "\"Change...\" lets you change the Username and Password.\n\n\"Test credentials\" will check that a ticket-granting ticket (TGT) can be acquired using these credentials.";
+	
+	// credentials
+	private final String usernameHelpString = "Username for a domain account. Just the plain username, not DOMAIN\\username or username@DOMAIN.COM or anything like that.";
+	private final String credentialsTestSuccessString = "TGT successfully acquired.";
 	private final String savePasswordHelpString = "Controls whether the password will be saved in Burp's settings file.";
 	private final String passwordHelpString = "The domain password for the specified user.";
-
-
+	
+	private final String credentialControlsHelpString = "\"Change...\" lets you change the Username and Password.\n\n\"Test credentials\" will check that a ticket-granting ticket (TGT) can be acquired using these credentials.";
+	
+	// delegation
+	private final String forwardableTgtString = "TGT is forwardable so delegation should work.";
+	private final String notForwardableTgtString = "TGT is not forwardable so delegation will not work - you should use the \"Create krb5.conf file\" button to fix this.";
+	private final String krb5FileHelpString = "The krb5.conf file which will be used (and controls whether delegation is enabled).";
+	private final String checkCurrentKrb5ConfigHelpString = "Check if the specified krb5.conf file sets forwarding enabled.";
+	private final String delegationControlsHelpString = "\"Change...\" lets you specify the location of the krb5.conf file.\n\n\"Create krb5.conf file\" creates a new minimal krb5.conf file, which will enable delegation, at a location of your choice on the file system.\n\n\"Check current config\" will verify that the specified krb5.conf file exists, and has delegation enabled.";
+	
+	// strategy
+	private final String authStrategyHelpString = "There are three possible approaches here:\n\nReactive: when a 401 response is received from the server, add an appropriate Kerberos authentication header and resend the request. This is what Fiddler does.\nProactive: for hosts which are in scope for Kerberos authentication, add the Kerberos authentication header to outgoing requests (i.e. don't wait to get a 401).\nProactive after 401: use the reactive strategy for the first Kerberos authentication against a particular host, then if it was successful, move to proactive.\n\nThe Reactive approach is perhaps the most \"correct\", but is slower (requires an extra HTTP round trip to the server).\nThe Proactive approach is faster.\nThe Proactive after 401 approach is usually a good compromise.";
+	
+	// scope
+	private final String scopeHelpString = "In this section, you can define which hosts are considered to be in scope for Kerberos authentication.\n\n\"All hosts in this Kerberos domain in scope for Kerberos\" is the default.\nThis means that Berserko will attempt Kerberos authentication only to web servers whose hostname ends with the domain DNS name.\n\n\"All hosts in scope for Kerberos authentication\" means that you don't need to bother specifying the scope manually.\nThe potential disadvantage of this configuration is that it might lead to Berserko sending Kerberos requests to the KDC to acquire service\ntickets for hosts which are not in the domain. This might cause performance issues, and might cause privacy issues (if you don't want this\ninformation leaked to the KDC).\n\nThe list box on the right allows you to specify additional hosts which should be in scope.\nIt is ignored when \"All hosts in scope for Kerberos authentication\" is selected.\n\nIf \"Plain hostnames considered part of domain\" is selected, Kerberos authentication will be attempted against hosts which are\nspecified by \"plain hostnames\", i.e. hostnames that are not qualified with the domain.\nThe only reason you might not want this would be if your machine was joined to a different domain from the one being\nauthenticated against using this extension.\n\nIf \"Do not perform Kerberos authentication to servers which support NTLM\" is selected, Kerberos authentication will not be performed\nagainst hosts which also support NTLM (as evidenced by a WWW-Authenticate: NTLM response header).\nThe purpose of selecting this would be to, for example, use Burp's existing NTLM authentication capability for these hosts.";
+	
+	// logging
+	private final String alertLevelHelpString = "Controls level of logging performed to Burp's Alerts tab.";
+	private final String loggingLevelHelpString = "Controls level of logging performed to extension's standard output.";
+	
 	@Override
 	public Component getUiComponent() {
 		return scroll;
@@ -1599,6 +1837,16 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	@Override
 	public String getTabCaption() {
 		return tabName;
+	}
+	
+	private void updateHostsInScope()
+	{
+		hostsInScope = new ArrayList<String>();
+		
+		for( int ii=0; ii<scopeListBox.getModel().getSize(); ii++)
+		{
+			hostsInScope.add( scopeListBox.getModel().getElementAt(ii));
+		}
 	}
 
 	private void setupGUI() {
@@ -1619,7 +1867,8 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 						"Do Kerberos authentication");
 				versionLabel = new JLabel(extensionName + " version "
 						+ versionString);
-				restoreDefaultsButton = new JButton("Restore defaults");
+				restoreDefaultsButton = new JButton("Restore default settings");
+				clearStateButton = new JButton("Clear Kerberos state");
 
 				domainPanel = new JPanel(new GridBagLayout());
 				domainPanel.setBorder(BorderFactory
@@ -1675,13 +1924,28 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				authStrategyGroup.add(proactiveButton);
 				authStrategyGroup.add(proactiveAfter401Button);
 				authStrategyGroup.add(reactiveButton);
+				authStrategyHelpButton = new JButton("?");
+				
+				everythingInScopeCheckBox = new JCheckBox(
+						"All hosts in scope for Kerberos authentication");
+				wholeDomainInScopeCheckBox = new JCheckBox(
+						"All hosts in this Kerberos domain in scope for Kerberos");
 				ignoreNTLMServersCheckBox = new JCheckBox(
 						"Do not perform Kerberos authentication to servers which support NTLM");
 				includePlainhostnamesCheckBox = new JCheckBox(
 						"Plain hostnames (i.e. unqualified names) considered part of domain");
-				authStrategyHelpButton = new JButton("?");
-				ignoreNTLMServersHelpButton = new JButton("?");
-				includePlainhostnamesHelpButton = new JButton("?");
+				scopeListBox = new JList<>( new DefaultListModel<String>());
+				scopeListBox.setSelectionMode( ListSelectionModel.SINGLE_SELECTION);
+				scopeBoxLabel = new JLabel( "Hosts in scope:");
+				scopePane = new JScrollPane( scopeListBox);
+				scopePane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_ALWAYS);
+				scopePane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+				scopeAddButton = new JButton( "Add");
+				scopeEditButton = new JButton( "Edit");
+				scopeRemoveButton = new JButton( "Remove");
+				//ignoreNTLMServersHelpButton = new JButton("?");
+				//includePlainhostnamesHelpButton = new JButton("?");
+				scopeHelpButton = new JButton( "?");
 
 				checkDelegationConfigButton = new JButton(
 						"Check current config");
@@ -1702,9 +1966,9 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				authenticationStrategyPanel.setBorder(BorderFactory
 						.createTitledBorder("Authentication Strategy"));
 
-				optionsPanel = new JPanel(new GridBagLayout());
-				optionsPanel.setBorder(BorderFactory
-						.createTitledBorder("Options"));
+				scopePanel = new JPanel(new GridBagLayout());
+				scopePanel.setBorder(BorderFactory
+						.createTitledBorder("Scope"));
 
 				delegationPanel = new JPanel(new GridBagLayout());
 				delegationPanel.setBorder(BorderFactory
@@ -1720,10 +1984,11 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				callbacks.customizeUiComponent(masterSwitchCheckBox);
 				callbacks.customizeUiComponent(versionLabel);
 				callbacks.customizeUiComponent(restoreDefaultsButton);
+				callbacks.customizeUiComponent(clearStateButton);
 				callbacks.customizeUiComponent(domainPanel);
 				callbacks.customizeUiComponent(credsPanel);
 				callbacks.customizeUiComponent(authenticationStrategyPanel);
-				callbacks.customizeUiComponent(optionsPanel);
+				callbacks.customizeUiComponent(scopePanel);
 				callbacks.customizeUiComponent(loggingPanel);
 				callbacks.customizeUiComponent(domainDnsLabel);
 				callbacks.customizeUiComponent(kdcLabel);
@@ -1754,11 +2019,21 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				callbacks.customizeUiComponent(proactiveButton);
 				callbacks.customizeUiComponent(proactiveAfter401Button);
 				callbacks.customizeUiComponent(reactiveButton);
+				callbacks.customizeUiComponent(authStrategyHelpButton);
+				
 				callbacks.customizeUiComponent(ignoreNTLMServersCheckBox);
 				callbacks.customizeUiComponent(includePlainhostnamesCheckBox);
-				callbacks.customizeUiComponent(authStrategyHelpButton);
-				callbacks.customizeUiComponent(ignoreNTLMServersHelpButton);
-				callbacks.customizeUiComponent(includePlainhostnamesHelpButton);
+				callbacks.customizeUiComponent(everythingInScopeCheckBox);
+				callbacks.customizeUiComponent(wholeDomainInScopeCheckBox);
+				callbacks.customizeUiComponent(scopeHelpButton);
+				callbacks.customizeUiComponent(scopeListBox);
+				callbacks.customizeUiComponent(scopePane);
+				callbacks.customizeUiComponent(scopeAddButton);
+				callbacks.customizeUiComponent(scopeEditButton);
+				callbacks.customizeUiComponent(scopeRemoveButton);
+				callbacks.customizeUiComponent(scopeBoxLabel);
+				//callbacks.customizeUiComponent(ignoreNTLMServersHelpButton);
+				//callbacks.customizeUiComponent(includePlainhostnamesHelpButton);
 
 				callbacks.customizeUiComponent(checkDelegationConfigButton);
 				callbacks.customizeUiComponent(createKrb5ConfButton);
@@ -1927,8 +2202,6 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				credsPanel.add(savePasswordHelpButton, gbc);
 
 				// DELEGATION PANEL LAYOUT
-
-
 				gbc.insets = new Insets(5, 5, 5, 5);
 				gbc.fill = GridBagConstraints.NONE;
 				gbc.weightx = 0.0;
@@ -2045,57 +2318,102 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				gbc.fill = GridBagConstraints.HORIZONTAL;
 				gbc.weightx = 1.0;
 				gbc.weighty = 0.0;
-				gbc.gridx = 0;
-				gbc.gridy = 1;
+				gbc.gridx = 1;
+				gbc.gridy = 0;
 				authenticationStrategyPanel.add(proactiveButton, gbc);
 				gbc.insets = new Insets(5, 5, 5, 5);
 				gbc.fill = GridBagConstraints.HORIZONTAL;
 				gbc.weightx = 1.0;
 				gbc.weighty = 0.0;
-				gbc.gridx = 0;
-				gbc.gridy = 2;
+				gbc.gridx = 2;
+				gbc.gridy = 0;
 				authenticationStrategyPanel.add(proactiveAfter401Button, gbc);
 				gbc.insets = new Insets(5, 5, 5, 5);
 				gbc.fill = GridBagConstraints.NONE;
 				gbc.weightx = 0.0;
 				gbc.weighty = 0.0;
-				gbc.gridx = 2;
+				gbc.gridx = 3;
 				gbc.gridy = 0;
 				authenticationStrategyPanel.add(authStrategyHelpButton, gbc);
 
-				// OPTIONS PANEL LAYOUT
+				// SCOPE PANEL LAYOUT
 				gbc.insets = new Insets(5, 5, 5, 5);
 				gbc.fill = GridBagConstraints.HORIZONTAL;
-				gbc.weightx = 1.0;
-				gbc.weighty = 0.0;
+				gbc.weightx = 2.0;
+				gbc.weighty = 1.0;
 				gbc.gridx = 0;
 				gbc.gridy = 0;
-				optionsPanel.add(ignoreNTLMServersCheckBox, gbc);
+				scopePanel.add(everythingInScopeCheckBox, gbc);
+				gbc.insets = new Insets(5, 5, 5, 5);
+				gbc.fill = GridBagConstraints.HORIZONTAL;
+				gbc.weightx = 2.0;
+				gbc.weighty = 1.0;
+				gbc.gridx = 0;
+				gbc.gridy = 1;
+				scopePanel.add(wholeDomainInScopeCheckBox, gbc);
+				gbc.insets = new Insets(5, 5, 5, 5);
+				gbc.fill = GridBagConstraints.HORIZONTAL;
+				gbc.weightx = 2.0;
+				gbc.weighty = 1.0;
+				gbc.gridx = 0;
+				gbc.gridy = 2;
+				scopePanel.add(includePlainhostnamesCheckBox, gbc);
 				gbc.insets = new Insets(5, 5, 5, 5);
 				gbc.fill = GridBagConstraints.HORIZONTAL;
 				gbc.weightx = 1.0;
-				gbc.weighty = 0.0;
+				gbc.weighty = 1.0;
 				gbc.gridx = 0;
+				gbc.gridy = 3;
+				scopePanel.add(ignoreNTLMServersCheckBox, gbc);
+				gbc.insets = new Insets(5, 5, 5, 5);
+				gbc.fill = GridBagConstraints.BOTH;
+				gbc.weightx = 4.0;
+				gbc.weighty = 3.0;
+				gbc.gridx = 1;
 				gbc.gridy = 1;
-				optionsPanel.add(includePlainhostnamesCheckBox, gbc);
+				gbc.gridheight = 3;
+				scopePanel.add(scopePane, gbc);
+				gbc.gridheight = 1;
+				gbc.insets = new Insets(5, 5, 5, 5);
+				gbc.fill = GridBagConstraints.HORIZONTAL;
+				gbc.weightx = 1.0;
+				gbc.weighty = 1.0;
+				gbc.gridx = 1;
+				gbc.gridy = 0;
+				scopePanel.add(scopeBoxLabel, gbc);
+				gbc.insets = new Insets(5, 5, 5, 5);
+				gbc.fill = GridBagConstraints.HORIZONTAL;
+				gbc.weightx = 1.0;
+				gbc.weighty = 1.0;
+				gbc.gridx = 2;
+				gbc.gridy = 1;
+				scopePanel.add(scopeAddButton, gbc);
+				gbc.insets = new Insets(5, 5, 5, 5);
+				gbc.fill = GridBagConstraints.HORIZONTAL;
+				gbc.weightx = 1.0;
+				gbc.weighty = 1.0;
+				gbc.gridx = 2;
+				gbc.gridy = 2;
+				scopePanel.add(scopeEditButton, gbc);
+				gbc.insets = new Insets(5, 5, 5, 5);
+				gbc.fill = GridBagConstraints.HORIZONTAL;
+				gbc.weightx = 1.0;
+				gbc.weighty = 1.0;
+				gbc.gridx = 2;
+				gbc.gridy = 3;
+				scopePanel.add(scopeRemoveButton, gbc);				
+				
 				gbc.insets = new Insets(5, 5, 5, 5);
 				gbc.fill = GridBagConstraints.NONE;
 				gbc.weightx = 0.0;
 				gbc.weighty = 0.0;
-				gbc.gridx = 1;
+				gbc.gridx = 3;
 				gbc.gridy = 0;
-				optionsPanel.add(ignoreNTLMServersHelpButton, gbc);
-				gbc.insets = new Insets(5, 5, 5, 5);
-				gbc.fill = GridBagConstraints.NONE;
-				gbc.weightx = 0.0;
-				gbc.weighty = 0.0;
-				gbc.gridx = 1;
-				gbc.gridy = 1;
-				optionsPanel.add(includePlainhostnamesHelpButton, gbc);
-
+				scopePanel.add(scopeHelpButton, gbc);
+				
 				// MAIN PANEL LAYOUT
 
-				gbc.gridwidth = 4;
+				gbc.gridwidth = 5;
 				gbc.fill = GridBagConstraints.HORIZONTAL;
 				gbc.weightx = 1.0;
 				gbc.weighty = 0.0;
@@ -2106,9 +2424,15 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				gbc.fill = GridBagConstraints.NONE;
 				gbc.weightx = 0.0;
 				gbc.weighty = 0.0;
-				gbc.gridx = 3;
+				gbc.gridx = 2;
 				gbc.gridy = 0;
 				mainPanel.add(restoreDefaultsButton, gbc);
+				gbc.fill = GridBagConstraints.NONE;
+				gbc.weightx = 0.0;
+				gbc.weighty = 0.0;
+				gbc.gridx = 3;
+				gbc.gridy = 0;
+				mainPanel.add(clearStateButton, gbc);
 				gbc.fill = GridBagConstraints.NONE;
 				gbc.weightx = 0.0;
 				gbc.weighty = 0.0;
@@ -2145,7 +2469,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				gbc.weighty = 0.1;
 				gbc.gridx = 0;
 				gbc.gridy = 5;
-				mainPanel.add(optionsPanel, gbc);
+				mainPanel.add(scopePanel, gbc);
 				gbc.weightx = 1.0;
 				gbc.weighty = 0.1;
 				gbc.gridx = 0;
@@ -2163,6 +2487,11 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 					public void actionPerformed(ActionEvent actionEvent) {
 						JCheckBox cb = (JCheckBox) actionEvent.getSource();
 						masterSwitchEnabled(cb.isSelected());
+						if( cb.isSelected())
+						{
+							updateScopeControls( !everythingInScope);
+							updateScopeListLabel(everythingInScope, wholeDomainInScope);
+						}
 					}
 				});
 
@@ -2228,6 +2557,28 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 						logLevel = cb.getSelectedIndex();
 					}
 				});
+				
+				everythingInScopeCheckBox
+				.addActionListener(new ActionListener() {
+					public void actionPerformed(ActionEvent actionEvent) {
+						JCheckBox cb = (JCheckBox) actionEvent
+								.getSource();
+						everythingInScope = cb.isSelected();
+						updateScopeControls( !everythingInScope);
+						updateScopeListLabel(everythingInScope, wholeDomainInScope);
+						warnIfProactiveAndEverythingInScope();
+					}
+				});		
+				
+				wholeDomainInScopeCheckBox
+				.addActionListener(new ActionListener() {
+					public void actionPerformed(ActionEvent actionEvent) {
+						JCheckBox cb = (JCheckBox) actionEvent
+								.getSource();
+						wholeDomainInScope = cb.isSelected();
+						updateScopeListLabel(everythingInScope, wholeDomainInScope);
+					}
+				});	
 
 				includePlainhostnamesCheckBox
 						.addActionListener(new ActionListener() {
@@ -2246,6 +2597,101 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 								ignoreNTLMServers = cb.isSelected();
 							}
 						});
+				
+				scopeAddButton.addActionListener(new ActionListener() {
+					public void actionPerformed(ActionEvent e) {
+						String s = hostDialogBox("");
+						
+						while( s.length() > 0 && !checkSpecialHostnameRegexp(s))
+						{
+							if( !checkSpecialHostnameRegexp(s))
+							{
+								JOptionPane
+								.showMessageDialog(
+										null,
+										"Not a valid hostname expression",
+										"Error", JOptionPane.ERROR_MESSAGE);
+							}
+							
+							s = hostDialogBox(s);
+						}
+						
+						if( s.length() > 0)
+						{
+							for( int ii=0; ii<scopeListBox.getModel().getSize(); ii++)
+							{
+								if( s.equals(((DefaultListModel<String>) scopeListBox.getModel()).getElementAt(ii)))
+								{
+									JOptionPane
+									.showMessageDialog(
+											null,
+											"Already present in list",
+											"Error", JOptionPane.ERROR_MESSAGE);
+									return;
+								}
+							}
+							
+							((DefaultListModel<String>) scopeListBox.getModel()).addElement( s);
+							updateHostsInScope();
+						}
+					}
+				});	
+				
+				scopeEditButton.addActionListener(new ActionListener() {
+					public void actionPerformed(ActionEvent e) {
+						int index = scopeListBox.getSelectedIndex(); 
+					    if (index != -1) 
+					    { 
+					    	String s = ((DefaultListModel<String>) scopeListBox.getModel()).getElementAt(index);
+					    	
+					    	s = hostDialogBox(s);
+					    	
+							while( s.length() > 0 && !checkSpecialHostnameRegexp(s))
+							{
+								if( !checkSpecialHostnameRegexp(s))
+								{
+									JOptionPane
+									.showMessageDialog(
+											null,
+											"Not a valid hostname expression",
+											"Error", JOptionPane.ERROR_MESSAGE);
+								}
+								
+								s = hostDialogBox(s);
+							}
+					    	
+					    	if( s.length() > 0)
+							{
+								for( int ii=0; ii<scopeListBox.getModel().getSize(); ii++)
+								{
+									if( ii != index && s.equals(((DefaultListModel<String>) scopeListBox.getModel()).getElementAt(ii)))
+									{
+										JOptionPane
+										.showMessageDialog(
+												null,
+												"Already present in list",
+												"Error", JOptionPane.ERROR_MESSAGE);
+										return;
+									}
+								}
+					    		
+								((DefaultListModel<String>) scopeListBox.getModel()).setElementAt( s, index);
+								updateHostsInScope();
+							}
+					    }
+					}
+				});	
+				
+				scopeRemoveButton.addActionListener(new ActionListener() {
+					public void actionPerformed(ActionEvent e) {
+						int index = scopeListBox.getSelectedIndex(); 
+					    if (index != -1) 
+					    { 
+					    	((DefaultListModel<String>) scopeListBox.getModel()).removeElementAt(index);
+					    	updateHostsInScope();
+					    } 
+					}
+				});						
 
 				proactiveAfter401Button.addActionListener(new ActionListener() {
 					public void actionPerformed(ActionEvent e) {
@@ -2256,6 +2702,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				proactiveButton.addActionListener(new ActionListener() {
 					public void actionPerformed(ActionEvent e) {
 						authStrategy = AuthStrategy.PROACTIVE;
+						warnIfProactiveAndEverythingInScope();
 					}
 				});
 
@@ -2361,6 +2808,21 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 						initialiseGUIFromConfig();
 					}
 				});
+				
+				clearStateButton.addActionListener(new ActionListener() {
+					public void actionPerformed(ActionEvent e) {
+						int n = JOptionPane.showConfirmDialog(
+								null,
+								"Are you sure you want to clear the current Kerberos state (tickets, cached SPN mappings, etc.)?\n\nThere is usually no need to do this unless changes have been made on the server side and you want to start from a clean state.", "Clear Kerberos state",
+								JOptionPane.YES_NO_OPTION);
+
+						if (n == JOptionPane.NO_OPTION) {
+							return;
+						}	
+						
+						clearKerberosState();
+					}
+				});
 
 				domainDnsNameHelpButton
 						.addActionListener(new HelpButtonActionListener(
@@ -2379,12 +2841,9 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 				authStrategyHelpButton
 						.addActionListener(new HelpButtonActionListener(
 								authStrategyHelpString));
-				includePlainhostnamesHelpButton
+				scopeHelpButton
 						.addActionListener(new HelpButtonActionListener(
-								includePlainhostnamesHelpString));
-				ignoreNTLMServersHelpButton
-						.addActionListener(new HelpButtonActionListener(
-								ignoreNTLMServersHelpString));
+								scopeHelpString));				
 				checkCurrentKrb5ConfigHelpButton
 						.addActionListener(new HelpButtonActionListener(checkCurrentKrb5ConfigHelpString));
 				delegationControlsHelpButton
@@ -2411,7 +2870,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 					.showMessageDialog(
 							null,
 							"No krb5.conf file has been specified yet - delegation won't currently work.\n\nUse the \"Change\" button to specify a file, or \"Create krb5.conf file\" to create a new one.",
-							"Success", JOptionPane.ERROR_MESSAGE);
+							"Error", JOptionPane.ERROR_MESSAGE);
 		} else {
 			if (new File(krb5File).exists()) {
 				boolean result = checkConfigFileForForwardable(krb5File);
@@ -2448,17 +2907,18 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 	private void initialiseGUIFromConfig() {
 		masterSwitchCheckBox.setSelected(masterSwitch);
 		masterSwitchEnabled(masterSwitch);
+		
 		domainDnsNameTextField.setText(domainDnsName);
 		kdcTextField.setText(kdcHost);
 		domainStatusTextField.setText("");
+		
 		credentialsStatusTextField.setText("");
 		usernameTextField.setText(username);
 		passwordField.setText(password);
 		savePasswordCheckBox.setSelected(savePassword);
-		alertLevelComboBox.setSelectedIndex(alertLevel);
-		loggingLevelComboBox.setSelectedIndex(logLevel);
-		includePlainhostnamesCheckBox.setSelected(plainhostExpand);
-		ignoreNTLMServersCheckBox.setSelected(ignoreNTLMServers);
+		
+		krb5FileTextField.setText(krb5File);
+		
 		switch (authStrategy) {
 		case PROACTIVE:
 			proactiveButton.setSelected(true);
@@ -2470,8 +2930,51 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 			reactiveButton.setSelected(true);
 			break;
 		}
-
-		krb5FileTextField.setText(krb5File);
+		
+		everythingInScopeCheckBox.setSelected(everythingInScope);
+		wholeDomainInScopeCheckBox.setSelected(wholeDomainInScope);
+		for( String s : hostsInScope)
+		{
+			((DefaultListModel<String>) scopeListBox.getModel()).addElement( s);
+		}
+		includePlainhostnamesCheckBox.setSelected(plainhostExpand);
+		ignoreNTLMServersCheckBox.setSelected(ignoreNTLMServers);
+		//updateScopeControls( !everythingInScope);
+		//updateScopeListLabel(everythingInScope, wholeDomainInScope);
+		
+		alertLevelComboBox.setSelectedIndex(alertLevel);
+		loggingLevelComboBox.setSelectedIndex(logLevel);
+	}
+	
+	
+	private void updateScopeControls( boolean enable)
+	{
+		wholeDomainInScopeCheckBox.setEnabled(enable);
+		includePlainhostnamesCheckBox.setEnabled(enable);
+		scopeListBox.setEnabled(enable);
+		scopeBoxLabel.setEnabled(enable);
+		scopeAddButton.setEnabled(enable);
+		scopeEditButton.setEnabled(enable);
+		scopeRemoveButton.setEnabled(enable);
+	}
+	
+	private void updateScopeListLabel( boolean everythingInScope, boolean wholeDomainInScope)
+	{
+		if( everythingInScope)
+		{
+			scopeBoxLabel.setText( "Additional hosts in scope:");
+		}
+		else
+		{
+			if( wholeDomainInScope)
+			{
+				scopeBoxLabel.setText( "Additional hosts in scope:");
+			}
+			else
+			{
+				scopeBoxLabel.setText( "Hosts in scope:");
+			}
+		}
 	}
 
 	// http://stackoverflow.com/questions/10985734/java-swing-enabling-disabling-all-components-in-jpanel
@@ -2496,8 +2999,8 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 		enableComponents(credsPanel, enabled);
 		authenticationStrategyPanel.setEnabled(enabled);
 		enableComponents(authenticationStrategyPanel, enabled);
-		optionsPanel.setEnabled(enabled);
-		enableComponents(optionsPanel, enabled);
+		scopePanel.setEnabled(enabled);
+		enableComponents(scopePanel, enabled);
 		loggingPanel.setEnabled(enabled);
 		enableComponents(loggingPanel, enabled);
 		delegationPanel.setEnabled(enabled);
@@ -2518,6 +3021,20 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 								"Password is not set - probably because it wasn't saved in the extension settings.\n\nYou need to set it (unless the account has a blank password of course).",
 								"Warning", JOptionPane.WARNING_MESSAGE);
 			}
+			
+			warnIfProactiveAndEverythingInScope();
+		}
+	}
+	
+	private void warnIfProactiveAndEverythingInScope()
+	{
+		if( authStrategy == AuthStrategy.PROACTIVE && everythingInScope)
+		{
+			JOptionPane
+			.showMessageDialog(
+					null,
+					"It is not recommended to set all hosts in scope in combination with the 'Proactive' strategy, as this may lead to lots of spurious Kerberos traffic (and possible privacy issues).\n\nIt is suggested to use 'Proactive after 401' instead.",
+					"Warning", JOptionPane.WARNING_MESSAGE);
 		}
 	}
 
@@ -2580,9 +3097,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 		}
 
 		if ((newDomainDnsNameTextField.getText() != domainDnsName)
-				|| (newKdcTextField.getText() != kdcHost)) // don't do anything
-															// if values are
-															// unchanged
+				|| (newKdcTextField.getText() != kdcHost)) // don't do anything if values are unchanged
 		{
 			domainDnsName = newDomainDnsNameTextField.getText();
 			domainDnsNameTextField.setText(newDomainDnsNameTextField.getText());
@@ -2604,6 +3119,39 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 		domainDnsNameTextField.setText(newDomainDnsNameTextField.getText());
 		kdcTextField.setText(newKdcTextField.getText());
 
+	}
+	
+	// 
+	// ValidHostnameRegex = "^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$";
+	
+	private boolean checkSpecialHostnameRegexp(String input) {
+		// https://stackoverflow.com/questions/106179/regular-expression-to-match-dns-hostname-or-ip-address
+		String pattern = "^(([a-zA-Z0-9\\*\\?]|[a-zA-Z0-9\\*\\?][a-zA-Z0-9\\-\\*\\?]*[a-zA-Z0-9\\*\\?])\\.)*([A-Za-z0-9\\*\\?]|[A-Za-z0-9\\*\\?][A-Za-z0-9\\*\\?\\-]*[A-Za-z0-9\\*\\?])$";
+		Pattern r = Pattern.compile(pattern);
+
+		Matcher m = r.matcher(input);
+
+		return m.find();
+	}
+	
+	private String hostDialogBox( String input)
+	{
+		JTextField hostnameTextField = new JTextField();
+		hostnameTextField.setText(input);
+		
+		final JComponent[] inputs = new JComponent[] { new JLabel("Specify a hostname"), new JLabel( "You can use wildcards (* matches zero or more characters, ? matches any character except a dot)"),
+				hostnameTextField};
+		int result = JOptionPane.showConfirmDialog(null, inputs, input.length() == 0 ? "Add host" : "Edit host", JOptionPane.OK_CANCEL_OPTION,
+						JOptionPane.PLAIN_MESSAGE);
+		
+		if( result == JOptionPane.OK_OPTION)
+		{
+			return hostnameTextField.getText();
+		}
+		else
+		{
+			return "";
+		}
 	}
 
 	@SuppressWarnings("deprecation")
@@ -2628,10 +3176,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 		}
 
 		if ((newUsernameTextField.getText() != username)
-				|| (newPasswordField.getText() != password)) // don't do
-																// anything if
-																// values are
-																// unchanged
+				|| (newPasswordField.getText() != password)) // don't do anything if values are unchanged
 		{
 			username = newUsernameTextField.getText();
 			usernameTextField.setText(newUsernameTextField.getText());
@@ -2642,34 +3187,24 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 			if (username.isEmpty()) {
 				credentialsStatusTextField.setText("Username cannot be empty");
 			}
-			/*
-			 * else if( password.isEmpty()) {
-			 * credentialsStatusTextField.setText( "Password cannot be empty");
-			 * }
-			 */
 
 			setCredentials(username, password);
 		}
 	}
-
+	
 	private void testCredentials() {
+		
 		if (usernameTextField.getText().isEmpty()) {
 			JOptionPane.showMessageDialog(null, "Username not set yet",
 					"Error", JOptionPane.ERROR_MESSAGE);
 			return;
 		}
 
-		/*
-		 * if( passwordField.getText().isEmpty()) {
-		 * JOptionPane.showMessageDialog( null, "Password not set yet", "Error",
-		 * JOptionPane.ERROR_MESSAGE); return; }
-		 */
-
 		if (!(domainStatusTextField.getText().equals(kdcTestSuccessString))) {
 			int n = JOptionPane
 					.showConfirmDialog(
 							null,
-							"You haven't successfully tested the domain settings yet, do you want to continue without doing so?",
+							"You haven't successfully tested the domain settings yet, do you want to continue without doing so?\nIf the KDC can't be found, this command will hang Burp for quite a while (around 90 seconds).",
 							"Proceed?", JOptionPane.YES_NO_OPTION);
 
 			if (n == JOptionPane.NO_OPTION) {
@@ -2680,7 +3215,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 		setKrb5Config();
 
 		setupKerberosConfig();
-
+		
 		try {
 			LoginContext loginContext = new LoginContext("KrbLogin",
 					new KerberosCallBackHandler(username, password));
@@ -2708,6 +3243,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 								null,
 								"Failed to acquire TGT - username appears to be invalid.",
 								"Failure", JOptionPane.ERROR_MESSAGE);
+				log(1, "Error when testing credentials: " + e.getMessage());				
 			} else if (e.getMessage().startsWith(
 					"Pre-authentication information was invalid")) {
 				credentialsStatusTextField
@@ -2717,6 +3253,28 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 								null,
 								"Failed to acquire TGT - password appears to be invalid.\n\nBe careful not to lock out the account with more tests.",
 								"Failure", JOptionPane.ERROR_MESSAGE);
+				log(1, "Error when testing credentials: " + e.getMessage());
+			} else if( e.getMessage().startsWith( "KDC has no support for encryption type"))
+			{
+				credentialsStatusTextField
+				.setText("Failed to acquire TGT - encryption type not supported");
+				if( unlimitedJCE)
+				{
+					JOptionPane
+					.showMessageDialog(
+							null,
+							"Failed to acquire TGT - encryption algorithm not supported by KDC.\n\nThis is unexpected, as you appear to have the JCE Unlimited Strength Jurisdiction Policy installed.",
+							"Failure", JOptionPane.ERROR_MESSAGE);
+				}
+				else
+				{
+					JOptionPane
+					.showMessageDialog(
+							null,
+							"Failed to acquire TGT - encryption algorithm not supported by KDC.\n\nThis is likely to be because you do not have the JCE Unlimited Strength Jurisdiction Policy installed.\n\nSee http://docs.oracle.com/javase/7/docs/technotes/guides/security/SunProviders.html#importlimits\n\nAlso note that newer versions of Burp seem to have a workaround for this.",
+							"Failure", JOptionPane.ERROR_MESSAGE);
+				}
+				alertAndLog(1, "Error when testing credentials: " + e.getMessage());
 			} else {
 				credentialsStatusTextField.setText("Failed to acquire TGT: "
 						+ e.getMessage());
@@ -2796,7 +3354,8 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 								null,
 								"Failed to contact Kerberos service - error code 68 suggests that KDC is valid but domain DNS name is wrong",
 								"Failure", JOptionPane.ERROR_MESSAGE);
-			} else {
+			} 
+			else {
 				domainStatusTextField
 						.setText("Connected to port 88, but failed to contact Kerberos service: "
 								+ e.getMessage());
@@ -2912,4 +3471,6 @@ public class BurpExtender implements IBurpExtender, IHttpListener, ITab,
 					JOptionPane.INFORMATION_MESSAGE);
 		}
 	}
+	
+
 }
