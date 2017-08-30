@@ -2,8 +2,8 @@ Uuid: 94135ed444c84cc095c72e6520bcc583
 ExtensionType: 1
 Name: Kerberos Authentication
 RepoName: kerberos-authentication
-ScreenVersion: 0.9
-SerialVersion: 2
+ScreenVersion: 1.0
+SerialVersion: 3
 MinPlatformVersion: 0
 ProOnly: False
 Author: Richard Turnbull, NCC Group
